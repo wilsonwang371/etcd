@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	badger "github.com/dgraph-io/badger/v3"
 	humanize "github.com/dustin/go-humanize"
 	bolt "go.etcd.io/bbolt"
 	"go.uber.org/zap"
@@ -54,16 +55,16 @@ type Backend interface {
 
 	Snapshot() Snapshot
 	Hash(ignores map[IgnoreKey]struct{}) (uint32, error)
-	// Size returns the current size of the backend physically allocated.
-	// The backend can hold DB space that is not utilized at the moment,
+	// Size returns the current size of the boltdbBackend physically allocated.
+	// The boltdbBackend can hold DB space that is not utilized at the moment,
 	// since it can conduct pre-allocation or spare unused space for recycling.
 	// Use SizeInUse() instead for the actual DB size.
 	Size() int64
-	// SizeInUse returns the current size of the backend logically in use.
-	// Since the backend can manage free space in a non-byte unit such as
+	// SizeInUse returns the current size of the boltdbBackend logically in use.
+	// Since the boltdbBackend can manage free space in a non-byte unit such as
 	// number of pages, the returned value can be not exactly accurate in bytes.
 	SizeInUse() int64
-	// OpenReadTxN returns the number of currently open read transactions in the backend.
+	// OpenReadTxN returns the number of currently open read transactions in the boltdbBackend.
 	OpenReadTxN() int64
 	Defrag() error
 	ForceCommit()
@@ -79,7 +80,35 @@ type Snapshot interface {
 	Close() error
 }
 
-type backend struct {
+type boltdbBackend struct {
+	// size and commits are used with atomic operations so they must be
+	// 64-bit aligned, otherwise 32-bit tests will crash
+
+	// size is the number of bytes allocated in the boltdbBackend
+	size int64
+	// sizeInUse is the number of bytes actually used in the boltdbBackend
+	sizeInUse int64
+	// commits counts number of commits since start
+	commits int64
+	// openReadTxN is the number of currently open read transactions in the boltdbBackend
+	openReadTxN int64
+
+	mu sync.RWMutex
+	db *bolt.DB
+
+	batchInterval time.Duration
+	batchLimit    int
+	batchTx       *batchTxBufferedBoltDB
+
+	readTx *readTxBoltDB
+
+	stopc chan struct{}
+	donec chan struct{}
+
+	lg *zap.Logger
+}
+
+type badgerdbBackend struct {
 	// size and commits are used with atomic operations so they must be
 	// 64-bit aligned, otherwise 32-bit tests will crash
 
@@ -93,13 +122,13 @@ type backend struct {
 	openReadTxN int64
 
 	mu sync.RWMutex
-	db *bolt.DB
+	db *badger.DB
 
 	batchInterval time.Duration
 	batchLimit    int
-	batchTx       *batchTxBuffered
+	batchTx       *batchTxBufferedBadgerDB
 
-	readTx *readTx
+	readTx *readTxBadgerDB
 
 	stopc chan struct{}
 	donec chan struct{}
@@ -107,18 +136,99 @@ type backend struct {
 	lg *zap.Logger
 }
 
+func (b badgerdbBackend) ReadTx() ReadTx {
+	return b.readTx
+}
+
+func (b badgerdbBackend) BatchTx() BatchTx {
+	return b.batchTx
+}
+
+func (b badgerdbBackend) ConcurrentReadTx() ReadTx {
+	b.readTx.RLock()
+	defer b.readTx.RUnlock()
+	// prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTxBoltDB.RLock().
+	b.readTx.txWg.Add(1)
+	// TODO: might want to copy the read buffer lazily - create copy when A) end of a write transaction B) end of a batch interval.
+	return &concurrentReadTxBadgerDB{
+		baseReadTxBadgerDB: baseReadTxBadgerDB{
+			buf:     b.readTx.buf.unsafeCopy(),
+			txMu:    b.readTx.txMu,
+			tx:      b.readTx.tx,
+			buckets: b.readTx.buckets,
+			txWg:    b.readTx.txWg,
+		},
+	}
+}
+
+func (b badgerdbBackend) Snapshot() Snapshot {
+	panic("implement me")
+}
+
+func (b badgerdbBackend) Hash(ignores map[IgnoreKey]struct{}) (uint32, error) {
+	panic("implement me")
+}
+
+func (b badgerdbBackend) Size() int64 {
+	panic("implement me")
+}
+
+func (b badgerdbBackend) SizeInUse() int64 {
+	panic("implement me")
+}
+
+func (b badgerdbBackend) OpenReadTxN() int64 {
+	return atomic.LoadInt64(&b.openReadTxN)
+}
+
+func (b badgerdbBackend) Defrag() error {
+	panic("implement me")
+}
+
+func (b badgerdbBackend) ForceCommit() {
+	b.batchTx.Commit()
+}
+
+func (b badgerdbBackend) Close() error {
+	close(b.stopc)
+	<-b.donec
+	return b.db.Close()
+}
+
+func (b *badgerdbBackend) run() {
+	defer close(b.donec)
+	t := time.NewTimer(b.batchInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+		case <-b.stopc:
+			b.batchTx.CommitAndStop()
+			return
+		}
+		if b.batchTx.safePending() != 0 {
+			b.batchTx.Commit()
+		}
+		t.Reset(b.batchInterval)
+	}
+}
+
 type BackendConfig struct {
-	// Path is the file path to the backend file.
+	// Path is the file path to the boltdbBackend file.
 	Path string
+	// type of the database. badgerdb or boltdb
+	DBType string
+
 	// BatchInterval is the maximum time before flushing the BatchTx.
 	BatchInterval time.Duration
 	// BatchLimit is the maximum puts before flushing the BatchTx.
 	BatchLimit int
-	// BackendFreelistType is the backend boltdb's freelist type.
+	// BackendFreelistType is the boltdbBackend boltdb's freelist type.
 	BackendFreelistType bolt.FreelistType
-	// MmapSize is the number of bytes to mmap for the backend.
+	// MmapSize is the number of bytes to mmap for the boltdbBackend.
 	MmapSize uint64
-	// Logger logs backend-side operations.
+
+	// Logger logs boltdbBackend-side operations.
 	Logger *zap.Logger
 	// UnsafeNoFsync disables all uses of fsync.
 	UnsafeNoFsync bool `json:"unsafe-no-fsync"`
@@ -126,6 +236,7 @@ type BackendConfig struct {
 
 func DefaultBackendConfig() BackendConfig {
 	return BackendConfig{
+		DBType: "boltdb",
 		BatchInterval: defaultBatchInterval,
 		BatchLimit:    defaultBatchLimit,
 		MmapSize:      initialMmapSize,
@@ -142,7 +253,87 @@ func NewDefaultBackend(path string) Backend {
 	return newBackend(bcfg)
 }
 
-func newBackend(bcfg BackendConfig) *backend {
+func newBackend(bcfg BackendConfig) Backend {
+	var be Backend
+	switch bcfg.DBType {
+	case "badgerdb":
+		be = newBadgerDBBackend(bcfg)
+	case "boltdb":
+		be = newBoltDBBackend(bcfg)
+	default:
+		bcfg.Logger.Panic("invalid boltdbBackend database type. Expecting boltdb or badgerdb")
+	}
+	return be
+}
+
+func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
+	if bcfg.Logger == nil {
+		bcfg.Logger = zap.NewNop()
+	}
+
+	bopts := badger.DefaultOptions("").WithInMemory(true)
+
+	db, err := badger.Open(bopts)
+	if err != nil {
+		bcfg.Logger.Panic("failed to open database", zap.String("path", bcfg.Path), zap.Error(err))
+	}
+	b := &badgerdbBackend{
+		size:          0,
+		sizeInUse:     0,
+		commits:       0,
+		openReadTxN:   0,
+		mu:            sync.RWMutex{},
+		db:            db,
+		batchInterval: 0,
+		batchLimit:    0,
+		readTx:        &readTxBadgerDB{
+			baseReadTxBadgerDB: baseReadTxBadgerDB{
+				buf:     txReadBuffer{
+					txBuffer: txBuffer{make(map[string]*bucketBuffer)},
+				},
+				tx:      nil,
+				buckets: make(map[string]*bolt.Bucket),
+				txWg:    new(sync.WaitGroup),
+				txMu:    new(sync.RWMutex),
+			},
+		},
+
+		stopc:         make(chan struct{}),
+		donec:         make(chan struct{}),
+
+		lg:            bcfg.Logger,
+	}
+	b.batchTx = newBatchTxBufferedBadgerDB(b) //TODO
+	go b.run()
+	return b
+}
+
+func (b *badgerdbBackend) begin(write bool) *badger.Txn {
+	b.mu.RLock()
+	tx := b.unsafeBegin(write)
+	b.mu.RUnlock()
+
+	//size := tx.Size()
+	//db := tx.DB()
+	//stats := db.Stats()
+	//atomic.StoreInt64(&b.size, size)
+	//atomic.StoreInt64(&b.sizeInUse, size-(int64(stats.FreePageN)*int64(db.Info().PageSize)))
+	//atomic.StoreInt64(&b.openReadTxN, int64(stats.OpenTxN))
+
+	return tx
+}
+
+func (b *badgerdbBackend) unsafeBegin(write bool) *badger.Txn {
+	return b.db.NewTransaction(write)
+}
+
+
+
+
+
+
+
+func newBoltDBBackend(bcfg BackendConfig) *boltdbBackend {
 	if bcfg.Logger == nil {
 		bcfg.Logger = zap.NewNop()
 	}
@@ -163,14 +354,14 @@ func newBackend(bcfg BackendConfig) *backend {
 
 	// In future, may want to make buffering optional for low-concurrency systems
 	// or dynamically swap between buffered/non-buffered depending on workload.
-	b := &backend{
+	b := &boltdbBackend{
 		db: db,
 
 		batchInterval: bcfg.BatchInterval,
 		batchLimit:    bcfg.BatchLimit,
 
-		readTx: &readTx{
-			baseReadTx: baseReadTx{
+		readTx: &readTxBoltDB{
+			baseReadTxBoltDB: baseReadTxBoltDB{
 				buf: txReadBuffer{
 					txBuffer: txBuffer{make(map[string]*bucketBuffer)},
 				},
@@ -185,7 +376,7 @@ func newBackend(bcfg BackendConfig) *backend {
 
 		lg: bcfg.Logger,
 	}
-	b.batchTx = newBatchTxBuffered(b)
+	b.batchTx = newBatchTxBufferedBoltDB(b)
 	go b.run()
 	return b
 }
@@ -193,23 +384,23 @@ func newBackend(bcfg BackendConfig) *backend {
 // BatchTx returns the current batch tx in coalescer. The tx can be used for read and
 // write operations. The write result can be retrieved within the same tx immediately.
 // The write result is isolated with other txs until the current one get committed.
-func (b *backend) BatchTx() BatchTx {
+func (b *boltdbBackend) BatchTx() BatchTx {
 	return b.batchTx
 }
 
-func (b *backend) ReadTx() ReadTx { return b.readTx }
+func (b *boltdbBackend) ReadTx() ReadTx { return b.readTx }
 
 // ConcurrentReadTx creates and returns a new ReadTx, which:
-// A) creates and keeps a copy of backend.readTx.txReadBuffer,
+// A) creates and keeps a copy of boltdbBackend.readTxBoltDB.txReadBuffer,
 // B) references the boltdb read Tx (and its bucket cache) of current batch interval.
-func (b *backend) ConcurrentReadTx() ReadTx {
+func (b *boltdbBackend) ConcurrentReadTx() ReadTx {
 	b.readTx.RLock()
 	defer b.readTx.RUnlock()
-	// prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTx.RLock().
+	// prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTxBoltDB.RLock().
 	b.readTx.txWg.Add(1)
 	// TODO: might want to copy the read buffer lazily - create copy when A) end of a write transaction B) end of a batch interval.
-	return &concurrentReadTx{
-		baseReadTx: baseReadTx{
+	return &concurrentReadTxBoltDB{
+		baseReadTxBoltDB: baseReadTxBoltDB{
 			buf:     b.readTx.buf.unsafeCopy(),
 			txMu:    b.readTx.txMu,
 			tx:      b.readTx.tx,
@@ -220,11 +411,11 @@ func (b *backend) ConcurrentReadTx() ReadTx {
 }
 
 // ForceCommit forces the current batching tx to commit.
-func (b *backend) ForceCommit() {
+func (b *boltdbBackend) ForceCommit() {
 	b.batchTx.Commit()
 }
 
-func (b *backend) Snapshot() Snapshot {
+func (b *boltdbBackend) Snapshot() Snapshot {
 	b.batchTx.Commit()
 
 	b.mu.RLock()
@@ -273,7 +464,7 @@ type IgnoreKey struct {
 	Key    string
 }
 
-func (b *backend) Hash(ignores map[IgnoreKey]struct{}) (uint32, error) {
+func (b *boltdbBackend) Hash(ignores map[IgnoreKey]struct{}) (uint32, error) {
 	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 
 	b.mu.RLock()
@@ -305,15 +496,15 @@ func (b *backend) Hash(ignores map[IgnoreKey]struct{}) (uint32, error) {
 	return h.Sum32(), nil
 }
 
-func (b *backend) Size() int64 {
+func (b *boltdbBackend) Size() int64 {
 	return atomic.LoadInt64(&b.size)
 }
 
-func (b *backend) SizeInUse() int64 {
+func (b *boltdbBackend) SizeInUse() int64 {
 	return atomic.LoadInt64(&b.sizeInUse)
 }
 
-func (b *backend) run() {
+func (b *boltdbBackend) run() {
 	defer close(b.donec)
 	t := time.NewTimer(b.batchInterval)
 	defer t.Stop()
@@ -331,26 +522,26 @@ func (b *backend) run() {
 	}
 }
 
-func (b *backend) Close() error {
+func (b *boltdbBackend) Close() error {
 	close(b.stopc)
 	<-b.donec
 	return b.db.Close()
 }
 
 // Commits returns total number of commits since start
-func (b *backend) Commits() int64 {
+func (b *boltdbBackend) Commits() int64 {
 	return atomic.LoadInt64(&b.commits)
 }
 
-func (b *backend) Defrag() error {
+func (b *boltdbBackend) Defrag() error {
 	return b.defrag()
 }
 
-func (b *backend) defrag() error {
+func (b *boltdbBackend) defrag() error {
 	now := time.Now()
 
 	// TODO: make this non-blocking?
-	// lock batchTx to ensure nobody is using previous tx, and then
+	// lock batchTxBoltDB to ensure nobody is using previous tx, and then
 	// close previous ongoing tx.
 	b.batchTx.Lock()
 	defer b.batchTx.Unlock()
@@ -482,7 +673,7 @@ func defragdb(odb, tmpdb *bolt.DB, limit int) error {
 	for next, _ := c.First(); next != nil; next, _ = c.Next() {
 		b := tx.Bucket(next)
 		if b == nil {
-			return fmt.Errorf("backend: cannot defrag bucket %s", string(next))
+			return fmt.Errorf("boltdbBackend: cannot defrag bucket %s", string(next))
 		}
 
 		tmpb, berr := tmptx.CreateBucketIfNotExists(next)
@@ -516,7 +707,7 @@ func defragdb(odb, tmpdb *bolt.DB, limit int) error {
 	return tmptx.Commit()
 }
 
-func (b *backend) begin(write bool) *bolt.Tx {
+func (b *boltdbBackend) begin(write bool) *bolt.Tx {
 	b.mu.RLock()
 	tx := b.unsafeBegin(write)
 	b.mu.RUnlock()
@@ -531,7 +722,7 @@ func (b *backend) begin(write bool) *bolt.Tx {
 	return tx
 }
 
-func (b *backend) unsafeBegin(write bool) *bolt.Tx {
+func (b *boltdbBackend) unsafeBegin(write bool) *bolt.Tx {
 	tx, err := b.db.Begin(write)
 	if err != nil {
 		b.lg.Fatal("failed to begin tx", zap.Error(err))
@@ -539,12 +730,12 @@ func (b *backend) unsafeBegin(write bool) *bolt.Tx {
 	return tx
 }
 
-func (b *backend) OpenReadTxN() int64 {
+func (b *boltdbBackend) OpenReadTxN() int64 {
 	return atomic.LoadInt64(&b.openReadTxN)
 }
 
-// NewTmpBackend creates a backend implementation for testing.
-func NewTmpBackend(batchInterval time.Duration, batchLimit int) (*backend, string) {
+// NewTmpBackend creates a boltdbBackend implementation for testing.
+func NewTmpBackend(batchInterval time.Duration, batchLimit int) (*boltdbBackend, string) {
 	dir, err := ioutil.TempDir(os.TempDir(), "etcd_backend_test")
 	if err != nil {
 		panic(err)
@@ -552,10 +743,10 @@ func NewTmpBackend(batchInterval time.Duration, batchLimit int) (*backend, strin
 	tmpPath := filepath.Join(dir, "database")
 	bcfg := DefaultBackendConfig()
 	bcfg.Path, bcfg.BatchInterval, bcfg.BatchLimit = tmpPath, batchInterval, batchLimit
-	return newBackend(bcfg), tmpPath
+	return newBoltDBBackend(bcfg), tmpPath
 }
 
-func NewDefaultTmpBackend() (*backend, string) {
+func NewDefaultTmpBackend() (*boltdbBackend, string) {
 	return NewTmpBackend(defaultBatchInterval, defaultBatchLimit)
 }
 

@@ -88,7 +88,7 @@ func (txr *txReadBuffer) ForEach(bucketName []byte, visitor func(k, v []byte) er
 	return nil
 }
 
-// unsafeCopy returns a copy of txReadBuffer, caller should acquire backend.readTx.RLock()
+// unsafeCopy returns a copy of txReadBuffer, caller should acquire boltdbBackend.readTxBoltDB.RLock()
 func (txr *txReadBuffer) unsafeCopy() txReadBuffer {
 	txrCopy := txReadBuffer{
 		txBuffer: txBuffer{

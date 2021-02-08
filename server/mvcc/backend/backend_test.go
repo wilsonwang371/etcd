@@ -68,7 +68,7 @@ func TestBackendSnapshot(t *testing.T) {
 	}
 	f.Close()
 
-	// bootstrap new backend from the snapshot
+	// bootstrap new boltdbBackend from the snapshot
 	bcfg := DefaultBackendConfig()
 	bcfg.Path, bcfg.BatchInterval, bcfg.BatchLimit = f.Name(), time.Hour, 10000
 	nb := New(bcfg)
@@ -84,7 +84,7 @@ func TestBackendSnapshot(t *testing.T) {
 }
 
 func TestBackendBatchIntervalCommit(t *testing.T) {
-	// start backend with super short batch interval so
+	// start boltdbBackend with super short batch interval so
 	// we do not need to wait long before commit to happen.
 	b, tmpPath := NewTmpBackend(time.Nanosecond, 10000)
 	defer cleanup(b, tmpPath)
@@ -113,7 +113,7 @@ func TestBackendBatchIntervalCommit(t *testing.T) {
 		}
 		v := bucket.Get([]byte("foo"))
 		if v == nil {
-			t.Errorf("foo key failed to written in backend")
+			t.Errorf("foo key failed to written in boltdbBackend")
 		}
 		return nil
 	})

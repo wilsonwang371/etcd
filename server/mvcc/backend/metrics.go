@@ -21,7 +21,7 @@ var (
 		Namespace: "etcd",
 		Subsystem: "disk",
 		Name:      "backend_commit_duration_seconds",
-		Help:      "The latency distributions of commit called by backend.",
+		Help:      "The latency distributions of commit called by boltdbBackend.",
 
 		// lowest bucket start of upper bound 0.001 sec (1 ms) with factor 2
 		// highest bucket start of 0.001 sec * 2^13 == 8.192 sec
@@ -32,7 +32,7 @@ var (
 		Namespace: "etcd_debugging",
 		Subsystem: "disk",
 		Name:      "backend_commit_rebalance_duration_seconds",
-		Help:      "The latency distributions of commit.rebalance called by bboltdb backend.",
+		Help:      "The latency distributions of commit.rebalance called by bboltdb boltdbBackend.",
 
 		// lowest bucket start of upper bound 0.001 sec (1 ms) with factor 2
 		// highest bucket start of 0.001 sec * 2^13 == 8.192 sec
@@ -43,7 +43,7 @@ var (
 		Namespace: "etcd_debugging",
 		Subsystem: "disk",
 		Name:      "backend_commit_spill_duration_seconds",
-		Help:      "The latency distributions of commit.spill called by bboltdb backend.",
+		Help:      "The latency distributions of commit.spill called by bboltdb boltdbBackend.",
 
 		// lowest bucket start of upper bound 0.001 sec (1 ms) with factor 2
 		// highest bucket start of 0.001 sec * 2^13 == 8.192 sec
@@ -54,7 +54,7 @@ var (
 		Namespace: "etcd_debugging",
 		Subsystem: "disk",
 		Name:      "backend_commit_write_duration_seconds",
-		Help:      "The latency distributions of commit.write called by bboltdb backend.",
+		Help:      "The latency distributions of commit.write called by bboltdb boltdbBackend.",
 
 		// lowest bucket start of upper bound 0.001 sec (1 ms) with factor 2
 		// highest bucket start of 0.001 sec * 2^13 == 8.192 sec
@@ -65,7 +65,7 @@ var (
 		Namespace: "etcd",
 		Subsystem: "disk",
 		Name:      "backend_defrag_duration_seconds",
-		Help:      "The latency distribution of backend defragmentation.",
+		Help:      "The latency distribution of boltdbBackend defragmentation.",
 
 		// 100 MB usually takes 1 sec, so start with 10 MB of 100 ms
 		// lowest bucket start of upper bound 0.1 sec (100 ms) with factor 2
@@ -77,7 +77,7 @@ var (
 		Namespace: "etcd",
 		Subsystem: "disk",
 		Name:      "backend_snapshot_duration_seconds",
-		Help:      "The latency distribution of backend snapshots.",
+		Help:      "The latency distribution of boltdbBackend snapshots.",
 
 		// lowest bucket start of upper bound 0.01 sec (10 ms) with factor 2
 		// highest bucket start of 0.01 sec * 2^16 == 655.36 sec

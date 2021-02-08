@@ -12,5 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package backend defines a standard interface for etcd's backend MVCC storage.
+// Package boltdbBackend defines a standard interface for etcd's boltdbBackend MVCC storage.
 package backend

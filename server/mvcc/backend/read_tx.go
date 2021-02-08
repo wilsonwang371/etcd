@@ -16,6 +16,7 @@ package backend
 
 import (
 	"bytes"
+	"github.com/dgraph-io/badger/v3"
 	"math"
 	"sync"
 
@@ -37,8 +38,9 @@ type ReadTx interface {
 	UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error
 }
 
-// Base type for readTx and concurrentReadTx to eliminate duplicate functions between these
-type baseReadTx struct {
+
+// Base type for readTxBoltDB and concurrentReadTxBoltDB to eliminate duplicate functions between these
+type baseReadTxBoltDB struct {
 	// mu protects accesses to the txReadBuffer
 	mu  sync.RWMutex
 	buf txReadBuffer
@@ -52,7 +54,7 @@ type baseReadTx struct {
 	txWg *sync.WaitGroup
 }
 
-func (baseReadTx *baseReadTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
+func (baseReadTx *baseReadTxBoltDB) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
 	dups := make(map[string]struct{})
 	getDups := func(k, v []byte) error {
 		dups[string(k)] = struct{}{}
@@ -68,7 +70,7 @@ func (baseReadTx *baseReadTx) UnsafeForEach(bucketName []byte, visitor func(k, v
 		return err
 	}
 	baseReadTx.txMu.Lock()
-	err := unsafeForEach(baseReadTx.tx, bucketName, visitNoDup)
+	err := unsafeForEachBoltDB(baseReadTx.tx, bucketName, visitNoDup)
 	baseReadTx.txMu.Unlock()
 	if err != nil {
 		return err
@@ -76,7 +78,7 @@ func (baseReadTx *baseReadTx) UnsafeForEach(bucketName []byte, visitor func(k, v
 	return baseReadTx.buf.ForEach(bucketName, visitor)
 }
 
-func (baseReadTx *baseReadTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
+func (baseReadTx *baseReadTxBoltDB) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
 	if endKey == nil {
 		// forbid duplicates for single keys
 		limit = 1
@@ -119,35 +121,131 @@ func (baseReadTx *baseReadTx) UnsafeRange(bucketName, key, endKey []byte, limit 
 	c := bucket.Cursor()
 	baseReadTx.txMu.Unlock()
 
-	k2, v2 := unsafeRange(c, key, endKey, limit-int64(len(keys)))
+	k2, v2 := unsafeRangeBoltDB(c, key, endKey, limit-int64(len(keys)))
 	return append(k2, keys...), append(v2, vals...)
 }
 
-type readTx struct {
-	baseReadTx
+type readTxBoltDB struct {
+	baseReadTxBoltDB
 }
 
-func (rt *readTx) Lock()    { rt.mu.Lock() }
-func (rt *readTx) Unlock()  { rt.mu.Unlock() }
-func (rt *readTx) RLock()   { rt.mu.RLock() }
-func (rt *readTx) RUnlock() { rt.mu.RUnlock() }
+func (rt *readTxBoltDB) Lock()    { rt.mu.Lock() }
+func (rt *readTxBoltDB) Unlock()  { rt.mu.Unlock() }
+func (rt *readTxBoltDB) RLock()   { rt.mu.RLock() }
+func (rt *readTxBoltDB) RUnlock() { rt.mu.RUnlock() }
 
-func (rt *readTx) reset() {
+func (rt *readTxBoltDB) reset() {
 	rt.buf.reset()
 	rt.buckets = make(map[string]*bolt.Bucket)
 	rt.tx = nil
 	rt.txWg = new(sync.WaitGroup)
 }
 
-type concurrentReadTx struct {
-	baseReadTx
+type concurrentReadTxBoltDB struct {
+	baseReadTxBoltDB
 }
 
-func (rt *concurrentReadTx) Lock()   {}
-func (rt *concurrentReadTx) Unlock() {}
+func (rt *concurrentReadTxBoltDB) Lock()   {}
+func (rt *concurrentReadTxBoltDB) Unlock() {}
 
-// RLock is no-op. concurrentReadTx does not need to be locked after it is created.
-func (rt *concurrentReadTx) RLock() {}
+// RLock is no-op. concurrentReadTxBoltDB does not need to be locked after it is created.
+func (rt *concurrentReadTxBoltDB) RLock() {}
 
-// RUnlock signals the end of concurrentReadTx.
-func (rt *concurrentReadTx) RUnlock() { rt.txWg.Done() }
+// RUnlock signals the end of concurrentReadTxBoltDB.
+func (rt *concurrentReadTxBoltDB) RUnlock() { rt.txWg.Done() }
+
+
+// Base type for readTxBoltDB and concurrentReadTxBoltDB to eliminate duplicate functions between these
+type baseReadTxBadgerDB struct {
+	// mu protects accesses to the txReadBuffer
+	mu  sync.RWMutex
+	buf txReadBuffer
+
+	// TODO: group and encapsulate {txMu, tx, buckets, txWg}, as they share the same lifecycle.
+	// txMu protects accesses to buckets and tx on Range requests.
+	txMu    *sync.RWMutex
+	tx      *badger.Txn
+	buckets map[string]*bolt.Bucket
+	// txWg protects tx from being rolled back at the end of a batch interval until all reads using this tx are done.
+	txWg *sync.WaitGroup
+}
+
+func (baseReadTx *baseReadTxBadgerDB) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
+	dups := make(map[string]struct{})
+	getDups := func(k, v []byte) error {
+		dups[string(k)] = struct{}{}
+		return nil
+	}
+	visitNoDup := func(k, v []byte) error {
+		if _, ok := dups[string(k)]; ok {
+			return nil
+		}
+		return visitor(k, v)
+	}
+	if err := baseReadTx.buf.ForEach(bucketName, getDups); err != nil {
+		return err
+	}
+	baseReadTx.txMu.Lock()
+	err := unsafeForEachBadgerDB(baseReadTx.tx, bucketName, visitNoDup)
+	baseReadTx.txMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return baseReadTx.buf.ForEach(bucketName, visitor)
+}
+
+func (baseReadTx *baseReadTxBadgerDB) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
+	if endKey == nil {
+		// forbid duplicates for single keys
+		limit = 1
+	}
+	if limit <= 0 {
+		limit = math.MaxInt64
+	}
+	if limit > 1 && !bytes.Equal(bucketName, safeRangeBucket) {
+		panic("do not use unsafeRange on non-keys bucket")
+	}
+	keys, vals := baseReadTx.buf.Range(bucketName, key, endKey, limit)
+	if int64(len(keys)) == limit {
+		return keys, vals
+	}
+
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchSize = 10
+	c := baseReadTx.tx.NewIterator(opts)
+	defer c.Close()
+
+	baseReadTx.txMu.Unlock()
+
+	k2, v2 := unsafeRangeBadgerDB(c, key, endKey, limit-int64(len(keys)))
+	return append(k2, keys...), append(v2, vals...)
+}
+
+type readTxBadgerDB struct {
+	baseReadTxBadgerDB
+}
+
+func (rt *readTxBadgerDB) Lock()    { rt.mu.Lock() }
+func (rt *readTxBadgerDB) Unlock()  { rt.mu.Unlock() }
+func (rt *readTxBadgerDB) RLock()   { rt.mu.RLock() }
+func (rt *readTxBadgerDB) RUnlock() { rt.mu.RUnlock() }
+
+func (rt *readTxBadgerDB) reset() {
+	rt.buf.reset()
+	//rt.buckets = make(map[string]*bolt.Bucket)
+	rt.tx = nil
+	rt.txWg = new(sync.WaitGroup)
+}
+
+type concurrentReadTxBadgerDB struct {
+	baseReadTxBadgerDB
+}
+
+func (rt *concurrentReadTxBadgerDB) Lock()   {}
+func (rt *concurrentReadTxBadgerDB) Unlock() {}
+
+// RLock is no-op. concurrentReadTxBoltDB does not need to be locked after it is created.
+func (rt *concurrentReadTxBadgerDB) RLock() {}
+
+// RUnlock signals the end of concurrentReadTxBoltDB.
+func (rt *concurrentReadTxBadgerDB) RUnlock() { rt.txWg.Done() }

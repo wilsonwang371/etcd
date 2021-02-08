@@ -16,6 +16,7 @@ package backend
 
 import (
 	"bytes"
+	"github.com/dgraph-io/badger/v3"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -37,19 +38,201 @@ type BatchTx interface {
 	CommitAndStop()
 }
 
-type batchTx struct {
+type batchTxBadgerDB struct {
 	sync.Mutex
-	tx      *bolt.Tx
-	backend *backend
+	tx      *badger.Txn
+	backend *badgerdbBackend
 
 	pending int
 }
 
-func (t *batchTx) Lock() {
+func (t *batchTxBadgerDB) Lock() {
 	t.Mutex.Lock()
 }
 
-func (t *batchTx) Unlock() {
+func (t *batchTxBadgerDB) Unlock() {
+	if t.pending >= t.backend.batchLimit {
+		t.commit(false)
+	}
+	t.Mutex.Unlock()
+}
+
+
+func (t *batchTxBadgerDB) RLock() {
+	panic("unexpected RLock")
+}
+
+func (t *batchTxBadgerDB) RUnlock() {
+	panic("unexpected RUnlock")
+}
+
+func (t *batchTxBadgerDB) UnsafeCreateBucket(name []byte) {
+	// TODO
+	t.pending++
+}
+
+// UnsafePut must be called holding the lock on the tx.
+func (t *batchTxBadgerDB) UnsafePut(bucketName []byte, key []byte, value []byte) {
+	t.unsafePut(bucketName, key, value, false)
+}
+
+// UnsafeSeqPut must be called holding the lock on the tx.
+func (t *batchTxBadgerDB) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
+	t.unsafePut(bucketName, key, value, true)
+}
+
+func (t *batchTxBadgerDB) unsafePut(_ []byte, key []byte, value []byte, _ bool) {
+	if err := t.tx.Set(key, value); err != nil {
+		t.backend.lg.Fatal(
+			"failed to write data",
+			zap.Error(err),
+		)
+	}
+	t.pending++
+}
+
+// UnsafeRange must be called holding the lock on the tx.
+func (t *batchTxBadgerDB) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchSize = 10
+	it := t.tx.NewIterator(opts)
+	defer it.Close()
+	return unsafeRangeBadgerDB(it, key, endKey, limit)
+}
+
+func unsafeRangeBadgerDB(it *badger.Iterator, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
+	if limit <= 0 {
+		limit = math.MaxInt64
+	}
+	var isMatch func(b []byte) bool
+	if len(endKey) > 0 {
+		isMatch = func(b []byte) bool { return bytes.Compare(b, endKey) < 0 }
+	} else {
+		isMatch = func(b []byte) bool { return bytes.Equal(b, key) }
+		limit = 1
+	}
+
+	for it.Seek(key); it.ValidForPrefix(key) && isMatch(key); it.Next() {
+		item := it.Item()
+		keys = append(keys, item.Key())
+		val, err := item.ValueCopy(nil)
+		if err != nil {
+			break
+		}
+		vs = append(vs, val)
+		if limit == int64(len(keys)) {
+			break
+		}
+	}
+	return keys, vs
+}
+
+
+// UnsafeDelete must be called holding the lock on the tx.
+func (t *batchTxBadgerDB) UnsafeDelete(bucketName []byte, key []byte) {
+	err := t.tx.Delete(key)
+	if err != nil {
+		t.backend.lg.Fatal(
+			"failed to delete a key",
+			zap.Error(err),
+		)
+	}
+	t.pending++
+}
+
+// UnsafeForEach must be called holding the lock on the tx.
+func (t *batchTxBadgerDB) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
+	return unsafeForEachBadgerDB(t.tx, bucketName, visitor)
+}
+
+func unsafeForEachBadgerDB(tx *badger.Txn, bucket []byte, visitor func(k, v []byte) error) error {
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchSize = 10
+	it := tx.NewIterator(opts)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		item := it.Item()
+		k := item.Key()
+		err := item.Value(func(v []byte) error {
+			return visitor(k, v)
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Commit commits a previous tx and begins a new writable one.
+func (t *batchTxBadgerDB) Commit() {
+	t.Lock()
+	t.commit(false)
+	t.Unlock()
+}
+
+// CommitAndStop commits the previous tx and does not create a new one.
+func (t *batchTxBadgerDB) CommitAndStop() {
+	t.Lock()
+	t.commit(true)
+	t.Unlock()
+}
+
+func (t *batchTxBadgerDB) safePending() int {
+	t.Mutex.Lock()
+	defer t.Mutex.Unlock()
+	return t.pending
+}
+
+func (t *batchTxBadgerDB) commit(stop bool) {
+	// commit the last tx
+	if t.tx != nil {
+		if t.pending == 0 && !stop {
+			return
+		}
+
+		//start := time.Now()
+
+		// gofail: var beforeCommit struct{}
+		err := t.tx.Commit()
+		// gofail: var afterCommit struct{}
+
+		//rebalanceSec.Observe(t.tx.Stats().RebalanceTime.Seconds())
+		//spillSec.Observe(t.tx.Stats().SpillTime.Seconds())
+		//writeSec.Observe(t.tx.Stats().WriteTime.Seconds())
+		//commitSec.Observe(time.Since(start).Seconds())
+		atomic.AddInt64(&t.backend.commits, 1)
+
+		t.pending = 0
+		if err != nil {
+			t.backend.lg.Fatal("failed to commit tx", zap.Error(err))
+		}
+	}
+	if !stop {
+		t.tx = t.backend.begin(true)
+	}
+}
+
+
+
+
+
+
+
+
+
+type batchTxBoltDB struct {
+	sync.Mutex
+	tx      *bolt.Tx
+	backend *boltdbBackend
+
+	pending int
+}
+
+func (t *batchTxBoltDB) Lock() {
+	t.Mutex.Lock()
+}
+
+func (t *batchTxBoltDB) Unlock() {
 	if t.pending >= t.backend.batchLimit {
 		t.commit(false)
 	}
@@ -60,15 +243,15 @@ func (t *batchTx) Unlock() {
 // have appropriate semantics in BatchTx interface. Therefore should not be called.
 // TODO: might want to decouple ReadTx and BatchTx
 
-func (t *batchTx) RLock() {
+func (t *batchTxBoltDB) RLock() {
 	panic("unexpected RLock")
 }
 
-func (t *batchTx) RUnlock() {
+func (t *batchTxBoltDB) RUnlock() {
 	panic("unexpected RUnlock")
 }
 
-func (t *batchTx) UnsafeCreateBucket(name []byte) {
+func (t *batchTxBoltDB) UnsafeCreateBucket(name []byte) {
 	_, err := t.tx.CreateBucket(name)
 	if err != nil && err != bolt.ErrBucketExists {
 		t.backend.lg.Fatal(
@@ -81,16 +264,16 @@ func (t *batchTx) UnsafeCreateBucket(name []byte) {
 }
 
 // UnsafePut must be called holding the lock on the tx.
-func (t *batchTx) UnsafePut(bucketName []byte, key []byte, value []byte) {
+func (t *batchTxBoltDB) UnsafePut(bucketName []byte, key []byte, value []byte) {
 	t.unsafePut(bucketName, key, value, false)
 }
 
 // UnsafeSeqPut must be called holding the lock on the tx.
-func (t *batchTx) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
+func (t *batchTxBoltDB) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
 	t.unsafePut(bucketName, key, value, true)
 }
 
-func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq bool) {
+func (t *batchTxBoltDB) unsafePut(bucketName []byte, key []byte, value []byte, seq bool) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
 		t.backend.lg.Fatal(
@@ -114,7 +297,7 @@ func (t *batchTx) unsafePut(bucketName []byte, key []byte, value []byte, seq boo
 }
 
 // UnsafeRange must be called holding the lock on the tx.
-func (t *batchTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
+func (t *batchTxBoltDB) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
 		t.backend.lg.Fatal(
@@ -122,10 +305,10 @@ func (t *batchTx) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]
 			zap.String("bucket-name", string(bucketName)),
 		)
 	}
-	return unsafeRange(bucket.Cursor(), key, endKey, limit)
+	return unsafeRangeBoltDB(bucket.Cursor(), key, endKey, limit)
 }
 
-func unsafeRange(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
+func unsafeRangeBoltDB(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
 	if limit <= 0 {
 		limit = math.MaxInt64
 	}
@@ -148,7 +331,7 @@ func unsafeRange(c *bolt.Cursor, key, endKey []byte, limit int64) (keys [][]byte
 }
 
 // UnsafeDelete must be called holding the lock on the tx.
-func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
+func (t *batchTxBoltDB) UnsafeDelete(bucketName []byte, key []byte) {
 	bucket := t.tx.Bucket(bucketName)
 	if bucket == nil {
 		t.backend.lg.Fatal(
@@ -168,11 +351,11 @@ func (t *batchTx) UnsafeDelete(bucketName []byte, key []byte) {
 }
 
 // UnsafeForEach must be called holding the lock on the tx.
-func (t *batchTx) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
-	return unsafeForEach(t.tx, bucketName, visitor)
+func (t *batchTxBoltDB) UnsafeForEach(bucketName []byte, visitor func(k, v []byte) error) error {
+	return unsafeForEachBoltDB(t.tx, bucketName, visitor)
 }
 
-func unsafeForEach(tx *bolt.Tx, bucket []byte, visitor func(k, v []byte) error) error {
+func unsafeForEachBoltDB(tx *bolt.Tx, bucket []byte, visitor func(k, v []byte) error) error {
 	if b := tx.Bucket(bucket); b != nil {
 		return b.ForEach(visitor)
 	}
@@ -180,26 +363,26 @@ func unsafeForEach(tx *bolt.Tx, bucket []byte, visitor func(k, v []byte) error) 
 }
 
 // Commit commits a previous tx and begins a new writable one.
-func (t *batchTx) Commit() {
+func (t *batchTxBoltDB) Commit() {
 	t.Lock()
 	t.commit(false)
 	t.Unlock()
 }
 
 // CommitAndStop commits the previous tx and does not create a new one.
-func (t *batchTx) CommitAndStop() {
+func (t *batchTxBoltDB) CommitAndStop() {
 	t.Lock()
 	t.commit(true)
 	t.Unlock()
 }
 
-func (t *batchTx) safePending() int {
+func (t *batchTxBoltDB) safePending() int {
 	t.Mutex.Lock()
 	defer t.Mutex.Unlock()
 	return t.pending
 }
 
-func (t *batchTx) commit(stop bool) {
+func (t *batchTxBoltDB) commit(stop bool) {
 	// commit the last tx
 	if t.tx != nil {
 		if t.pending == 0 && !stop {
@@ -228,14 +411,14 @@ func (t *batchTx) commit(stop bool) {
 	}
 }
 
-type batchTxBuffered struct {
-	batchTx
+type batchTxBufferedBoltDB struct {
+	batchTxBoltDB
 	buf txWriteBuffer
 }
 
-func newBatchTxBuffered(backend *backend) *batchTxBuffered {
-	tx := &batchTxBuffered{
-		batchTx: batchTx{backend: backend},
+func newBatchTxBufferedBoltDB(backend *boltdbBackend) *batchTxBufferedBoltDB {
+	tx := &batchTxBufferedBoltDB{
+		batchTxBoltDB: batchTxBoltDB{backend: backend},
 		buf: txWriteBuffer{
 			txBuffer: txBuffer{make(map[string]*bucketBuffer)},
 			seq:      true,
@@ -245,7 +428,7 @@ func newBatchTxBuffered(backend *backend) *batchTxBuffered {
 	return tx
 }
 
-func (t *batchTxBuffered) Unlock() {
+func (t *batchTxBufferedBoltDB) Unlock() {
 	if t.pending != 0 {
 		t.backend.readTx.Lock() // blocks txReadBuffer for writing.
 		t.buf.writeback(&t.backend.readTx.buf)
@@ -254,29 +437,29 @@ func (t *batchTxBuffered) Unlock() {
 			t.commit(false)
 		}
 	}
-	t.batchTx.Unlock()
+	t.batchTxBoltDB.Unlock()
 }
 
-func (t *batchTxBuffered) Commit() {
+func (t *batchTxBufferedBoltDB) Commit() {
 	t.Lock()
 	t.commit(false)
 	t.Unlock()
 }
 
-func (t *batchTxBuffered) CommitAndStop() {
+func (t *batchTxBufferedBoltDB) CommitAndStop() {
 	t.Lock()
 	t.commit(true)
 	t.Unlock()
 }
 
-func (t *batchTxBuffered) commit(stop bool) {
+func (t *batchTxBufferedBoltDB) commit(stop bool) {
 	// all read txs must be closed to acquire boltdb commit rwlock
 	t.backend.readTx.Lock()
 	t.unsafeCommit(stop)
 	t.backend.readTx.Unlock()
 }
 
-func (t *batchTxBuffered) unsafeCommit(stop bool) {
+func (t *batchTxBufferedBoltDB) unsafeCommit(stop bool) {
 	if t.backend.readTx.tx != nil {
 		// wait all store read transactions using the current boltdb tx to finish,
 		// then close the boltdb tx
@@ -289,19 +472,100 @@ func (t *batchTxBuffered) unsafeCommit(stop bool) {
 		t.backend.readTx.reset()
 	}
 
-	t.batchTx.commit(stop)
+	t.batchTxBoltDB.commit(stop)
 
 	if !stop {
 		t.backend.readTx.tx = t.backend.begin(false)
 	}
 }
 
-func (t *batchTxBuffered) UnsafePut(bucketName []byte, key []byte, value []byte) {
-	t.batchTx.UnsafePut(bucketName, key, value)
+func (t *batchTxBufferedBoltDB) UnsafePut(bucketName []byte, key []byte, value []byte) {
+	t.batchTxBoltDB.UnsafePut(bucketName, key, value)
 	t.buf.put(bucketName, key, value)
 }
 
-func (t *batchTxBuffered) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
-	t.batchTx.UnsafeSeqPut(bucketName, key, value)
+func (t *batchTxBufferedBoltDB) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
+	t.batchTxBoltDB.UnsafeSeqPut(bucketName, key, value)
+	t.buf.putSeq(bucketName, key, value)
+}
+
+
+
+
+
+
+type batchTxBufferedBadgerDB struct {
+	batchTxBadgerDB
+	buf txWriteBuffer
+}
+
+func newBatchTxBufferedBadgerDB(backend *badgerdbBackend) *batchTxBufferedBadgerDB {
+	tx := &batchTxBufferedBadgerDB{
+		batchTxBadgerDB: batchTxBadgerDB{backend: backend},
+		buf: txWriteBuffer{
+			txBuffer: txBuffer{make(map[string]*bucketBuffer)},
+			seq:      true,
+		},
+	}
+	tx.Commit()
+	return tx
+}
+
+func (t *batchTxBufferedBadgerDB) Unlock() {
+	if t.pending != 0 {
+		t.backend.readTx.Lock() // blocks txReadBuffer for writing.
+		t.buf.writeback(&t.backend.readTx.buf)
+		t.backend.readTx.Unlock()
+		if t.pending >= t.backend.batchLimit {
+			t.commit(false)
+		}
+	}
+	t.batchTxBadgerDB.Unlock()
+}
+
+func (t *batchTxBufferedBadgerDB) Commit() {
+	t.Lock()
+	t.commit(false)
+	t.Unlock()
+}
+
+func (t *batchTxBufferedBadgerDB) CommitAndStop() {
+	t.Lock()
+	t.commit(true)
+	t.Unlock()
+}
+
+func (t *batchTxBufferedBadgerDB) commit(stop bool) {
+	// all read txs must be closed to acquire boltdb commit rwlock
+	t.backend.readTx.Lock()
+	t.unsafeCommit(stop)
+	t.backend.readTx.Unlock()
+}
+
+func (t *batchTxBufferedBadgerDB) unsafeCommit(stop bool) {
+	if t.backend.readTx.tx != nil {
+		// wait all store read transactions using the current boltdb tx to finish,
+		// then close the boltdb tx
+		go func(tx *badger.Txn, wg *sync.WaitGroup) {
+			wg.Wait()
+			tx.Discard()
+		}(t.backend.readTx.tx, t.backend.readTx.txWg)
+		t.backend.readTx.reset()
+	}
+
+	t.batchTxBadgerDB.commit(stop)
+
+	if !stop {
+		t.backend.readTx.tx = t.backend.begin(false)
+	}
+}
+
+func (t *batchTxBufferedBadgerDB) UnsafePut(bucketName []byte, key []byte, value []byte) {
+	t.batchTxBadgerDB.UnsafePut(bucketName, key, value)
+	t.buf.put(bucketName, key, value)
+}
+
+func (t *batchTxBufferedBadgerDB) UnsafeSeqPut(bucketName []byte, key []byte, value []byte) {
+	t.batchTxBadgerDB.UnsafeSeqPut(bucketName, key, value)
 	t.buf.putSeq(bucketName, key, value)
 }

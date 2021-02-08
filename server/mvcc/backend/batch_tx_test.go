@@ -162,14 +162,14 @@ func TestBatchTxCommit(t *testing.T) {
 		}
 		v := bucket.Get([]byte("foo"))
 		if v == nil {
-			t.Errorf("foo key failed to written in backend")
+			t.Errorf("foo key failed to written in boltdbBackend")
 		}
 		return nil
 	})
 }
 
 func TestBatchTxBatchLimitCommit(t *testing.T) {
-	// start backend with batch limit 1 so one write can
+	// start boltdbBackend with batch limit 1 so one write can
 	// trigger a commit
 	b, tmpPath := NewTmpBackend(time.Hour, 1)
 	defer cleanup(b, tmpPath)
@@ -190,7 +190,7 @@ func TestBatchTxBatchLimitCommit(t *testing.T) {
 		}
 		v := bucket.Get([]byte("foo"))
 		if v == nil {
-			t.Errorf("foo key failed to written in backend")
+			t.Errorf("foo key failed to written in boltdbBackend")
 		}
 		return nil
 	})
