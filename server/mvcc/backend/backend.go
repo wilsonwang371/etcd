@@ -44,6 +44,9 @@ var (
 
 	// minSnapshotWarningTimeout is the minimum threshold to trigger a long running snapshot warning.
 	minSnapshotWarningTimeout = 30 * time.Second
+
+
+	badgerDBGCBatchLimit  = 100
 )
 
 type Backend interface {
@@ -170,19 +173,24 @@ func (b badgerdbBackend) Hash(ignores map[IgnoreKey]struct{}) (uint32, error) {
 }
 
 func (b badgerdbBackend) Size() int64 {
-	panic("implement me")
+	l, d := b.db.Size()
+	return l + d
 }
 
 func (b badgerdbBackend) SizeInUse() int64 {
-	panic("implement me")
+	l, _ := b.db.Size()
+	return l
 }
 
 func (b badgerdbBackend) OpenReadTxN() int64 {
 	return atomic.LoadInt64(&b.openReadTxN)
 }
 
-func (b badgerdbBackend) Defrag() error {
-	panic("implement me")
+func (b badgerdbBackend) Defrag() error {return b.defrag()}
+
+func (b *badgerdbBackend) defrag() error {
+	// TODO: implement me
+	return nil
 }
 
 func (b badgerdbBackend) ForceCommit() {
@@ -210,6 +218,22 @@ func (b *badgerdbBackend) run() {
 			b.batchTx.Commit()
 		}
 		t.Reset(b.batchInterval)
+	}
+}
+
+func (b *badgerdbBackend) runGC() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			for i := 0; i < badgerDBGCBatchLimit; i++ {
+				err := b.db.RunValueLogGC(0.5)
+				if err != nil {
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -305,6 +329,7 @@ func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	}
 	b.batchTx = newBatchTxBufferedBadgerDB(b) //TODO
 	go b.run()
+	go b.runGC()
 	return b
 }
 

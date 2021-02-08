@@ -210,14 +210,9 @@ func (baseReadTx *baseReadTxBadgerDB) UnsafeRange(bucketName, key, endKey []byte
 		return keys, vals
 	}
 
-	opts := badger.DefaultIteratorOptions
-	opts.PrefetchSize = 10
-	c := baseReadTx.tx.NewIterator(opts)
-	defer c.Close()
-
 	baseReadTx.txMu.Unlock()
 
-	k2, v2 := unsafeRangeBadgerDB(c, key, endKey, limit-int64(len(keys)))
+	k2, v2 := unsafeRangeBadgerDB(baseReadTx.tx, bucketName, key, endKey, limit-int64(len(keys)))
 	return append(k2, keys...), append(v2, vals...)
 }
 

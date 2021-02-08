@@ -68,7 +68,6 @@ func (t *batchTxBadgerDB) RUnlock() {
 
 func (t *batchTxBadgerDB) UnsafeCreateBucket(name []byte) {
 	// TODO
-	t.pending++
 }
 
 // UnsafePut must be called holding the lock on the tx.
@@ -93,16 +92,16 @@ func (t *batchTxBadgerDB) unsafePut(_ []byte, key []byte, value []byte, _ bool) 
 
 // UnsafeRange must be called holding the lock on the tx.
 func (t *batchTxBadgerDB) UnsafeRange(bucketName, key, endKey []byte, limit int64) ([][]byte, [][]byte) {
-	opts := badger.DefaultIteratorOptions
-	opts.PrefetchSize = 10
-	it := t.tx.NewIterator(opts)
-	defer it.Close()
-	return unsafeRangeBadgerDB(it, key, endKey, limit)
+	return unsafeRangeBadgerDB(t.tx, bucketName, key, endKey, limit)
 }
 
-func unsafeRangeBadgerDB(it *badger.Iterator, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
+func unsafeRangeBadgerDB(tx *badger.Txn, bucketName []byte, key, endKey []byte, limit int64) (keys [][]byte, vs [][]byte) {
 	if limit <= 0 {
 		limit = math.MaxInt64
+	}
+	key = append(bucketName, key...)
+	if len(endKey) != 0 {
+		endKey = append(bucketName, endKey...)
 	}
 	var isMatch func(b []byte) bool
 	if len(endKey) > 0 {
@@ -112,12 +111,33 @@ func unsafeRangeBadgerDB(it *badger.Iterator, key, endKey []byte, limit int64) (
 		limit = 1
 	}
 
-	for it.Seek(key); it.ValidForPrefix(key) && isMatch(key); it.Next() {
-		item := it.Item()
-		keys = append(keys, item.Key())
-		val, err := item.ValueCopy(nil)
+	if len(endKey) == 0 {
+		item, err := tx.Get(key)
+		if err == badger.ErrKeyNotFound {
+			return nil, nil
+		}
 		if err != nil {
-			break
+			panic(err)
+		}
+		v, err := item.ValueCopy(nil)
+		if err != nil {
+			panic(err)
+		}
+		return [][]byte{item.KeyCopy(nil)}, [][]byte{v}
+	}
+
+	opts := badger.DefaultIteratorOptions
+	opts.PrefetchSize = 10
+	it := tx.NewIterator(opts)
+	defer it.Close()
+
+	bucketNameLen := len(bucketName)
+
+	for it.Seek(key); it.Valid() && isMatch(it.Item().Key()); it.Next() {
+		keys = append(keys, it.Item().KeyCopy(nil)[bucketNameLen:])
+		val, err := it.Item().ValueCopy(nil)
+		if err != nil {
+			panic(err)
 		}
 		vs = append(vs, val)
 		if limit == int64(len(keys)) {
@@ -130,7 +150,7 @@ func unsafeRangeBadgerDB(it *badger.Iterator, key, endKey []byte, limit int64) (
 
 // UnsafeDelete must be called holding the lock on the tx.
 func (t *batchTxBadgerDB) UnsafeDelete(bucketName []byte, key []byte) {
-	err := t.tx.Delete(key)
+	err := t.tx.Delete(append(bucketName, key...))
 	if err != nil {
 		t.backend.lg.Fatal(
 			"failed to delete a key",
@@ -150,7 +170,7 @@ func unsafeForEachBadgerDB(tx *badger.Txn, bucket []byte, visitor func(k, v []by
 	opts.PrefetchSize = 10
 	it := tx.NewIterator(opts)
 	defer it.Close()
-	for it.Rewind(); it.Valid(); it.Next() {
+	for it.Seek(bucket); it.ValidForPrefix(bucket); it.Next() {
 		item := it.Item()
 		k := item.Key()
 		err := item.Value(func(v []byte) error {
