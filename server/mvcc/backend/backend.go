@@ -295,7 +295,7 @@ func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 		bcfg.Logger = zap.NewNop()
 	}
 
-	bopts := badger.DefaultOptions("").WithInMemory(true)
+	bopts := badger.DefaultOptions("/root/db")
 
 	db, err := badger.Open(bopts)
 	if err != nil {
