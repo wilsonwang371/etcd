@@ -260,7 +260,7 @@ type BackendConfig struct {
 
 func DefaultBackendConfig() BackendConfig {
 	return BackendConfig{
-		DBType: "boltdb",
+		DBType: "badgerdb",
 		BatchInterval: defaultBatchInterval,
 		BatchLimit:    defaultBatchLimit,
 		MmapSize:      initialMmapSize,
