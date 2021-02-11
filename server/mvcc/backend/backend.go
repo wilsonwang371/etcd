@@ -299,7 +299,7 @@ func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	}
 
 	if savePath == "" {
-		bopts = badger.DefaultOptions(savePath).WithInMemory(true)
+		bopts = badger.DefaultOptions(savePath).WithInMemory(true).WithMemTableSize(16*1024*1024*1024)
 	} else {
 		bopts = badger.DefaultOptions(savePath)
 	}
