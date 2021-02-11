@@ -210,8 +210,6 @@ func (baseReadTx *baseReadTxBadgerDB) UnsafeRange(bucketName, key, endKey []byte
 		return keys, vals
 	}
 
-	baseReadTx.txMu.Unlock()
-
 	k2, v2 := unsafeRangeBadgerDB(baseReadTx.tx, bucketName, key, endKey, limit-int64(len(keys)))
 	return append(k2, keys...), append(v2, vals...)
 }
