@@ -291,11 +291,20 @@ func newBackend(bcfg BackendConfig) Backend {
 }
 
 func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
+	var bopts badger.Options
+	savePath := "" // "/root/db"
+
 	if bcfg.Logger == nil {
 		bcfg.Logger = zap.NewNop()
 	}
 
-	bopts := badger.DefaultOptions("/root/db")
+	if savePath == "" {
+		bopts = badger.DefaultOptions(savePath).WithInMemory(true)
+	} else {
+		bopts = badger.DefaultOptions(savePath)
+	}
+
+
 
 	db, err := badger.Open(bopts)
 	if err != nil {
