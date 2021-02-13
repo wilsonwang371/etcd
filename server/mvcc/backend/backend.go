@@ -47,6 +47,7 @@ var (
 
 
 	badgerDBGCBatchLimit  = 100
+	badgerDBGCFreq = 5 * time.Minute
 )
 
 type Backend interface {
@@ -222,7 +223,7 @@ func (b *badgerdbBackend) run() {
 }
 
 func (b *badgerdbBackend) runGC() {
-	t := time.NewTicker(5 * time.Minute)
+	t := time.NewTicker(badgerDBGCFreq)
 	defer t.Stop()
 	for {
 		select {
@@ -338,7 +339,7 @@ func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	}
 	b.batchTx = newBatchTxBufferedBadgerDB(b) //TODO
 	go b.run()
-	go b.runGC()
+	//go b.runGC()
 	return b
 }
 
