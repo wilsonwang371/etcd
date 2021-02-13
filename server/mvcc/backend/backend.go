@@ -229,7 +229,7 @@ func (b *badgerdbBackend) runGC() {
 		select {
 		case <-t.C:
 			for i := 0; i < badgerDBGCBatchLimit; i++ {
-				err := b.db.RunValueLogGC(0.5)
+				err := b.db.RunValueLogGC(0.8)
 				if err != nil {
 					break
 				}
