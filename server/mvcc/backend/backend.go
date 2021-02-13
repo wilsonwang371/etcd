@@ -47,7 +47,7 @@ var (
 
 
 	badgerDBGCBatchLimit  = 100
-	badgerDBGCFreq = 5 * time.Minute
+	badgerDBGCFreq = 1 * time.Minute
 )
 
 type Backend interface {
@@ -294,7 +294,7 @@ func newBackend(bcfg BackendConfig) Backend {
 func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	var bopts badger.Options
 	savePath := "" //"./db"
-	disableGC := true
+	disableGC := false
 
 	if bcfg.Logger == nil {
 		bcfg.Logger = zap.NewNop()
@@ -340,7 +340,7 @@ func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	}
 	b.batchTx = newBatchTxBufferedBadgerDB(b) //TODO
 	go b.run()
-	if ! disableGC {
+	if !disableGC {
 		go b.runGC()
 	}
 	return b
