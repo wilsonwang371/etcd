@@ -294,7 +294,7 @@ func newBackend(bcfg BackendConfig) Backend {
 func newBadgerDBBackend(bcfg BackendConfig) *badgerdbBackend {
 	var bopts badger.Options
 	savePath := "./db"
-	disableGC := false
+	disableGC := true
 
 	if bcfg.Logger == nil {
 		bcfg.Logger = zap.NewNop()
