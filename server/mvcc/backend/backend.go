@@ -46,7 +46,7 @@ var (
 	minSnapshotWarningTimeout = 30 * time.Second
 
 
-	badgerDBGCBatchLimit  = 100
+	badgerDBGCBatchLimit  = 10000
 	badgerDBGCFreq = 1 * time.Minute
 )
 
