@@ -102,6 +102,7 @@ type backend struct {
 	batchTx       *batchTxBuffered
 
 	readTx *readTx
+	cachedPrevReadTxBuf *txReadBuffer
 
 	stopc chan struct{}
 	donec chan struct{}
@@ -184,6 +185,7 @@ func newBackend(bcfg BackendConfig) *backend {
 			baseReadTx: baseReadTx{
 				buf: txReadBuffer{
 					txBuffer: txBuffer{make(map[string]*bucketBuffer)},
+					isModified: false,
 				},
 				buckets: make(map[string]*bolt.Bucket),
 				txWg:    new(sync.WaitGroup),
@@ -222,9 +224,17 @@ func (b *backend) ConcurrentReadTx() ReadTx {
 	// prevent boltdb read Tx from been rolled back until store read Tx is done. Needs to be called when holding readTx.RLock().
 	b.readTx.txWg.Add(1)
 	// TODO: might want to copy the read buffer lazily - create copy when A) end of a write transaction B) end of a batch interval.
+	var buf *txReadBuffer
+	modified := b.readTx.buf.IsModified()
+	if modified || (!modified && b.cachedPrevReadTxBuf == nil) {
+		tmp := b.readTx.buf.unsafeCopy()
+		b.cachedPrevReadTxBuf = &tmp
+	}
+	b.readTx.buf.ResetModified()
+	buf = b.cachedPrevReadTxBuf
 	return &concurrentReadTx{
 		baseReadTx: baseReadTx{
-			buf:     b.readTx.buf.unsafeCopy(),
+			buf:     *buf,
 			txMu:    b.readTx.txMu,
 			tx:      b.readTx.tx,
 			buckets: b.readTx.buckets,
