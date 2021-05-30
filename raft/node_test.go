@@ -632,7 +632,7 @@ func TestNodeStart(t *testing.T) {
 	storage.Append(rd.Entries)
 	n.Advance()
 
-	n.Propose(ctx, []byte("foo"))
+	n.Propose(ctx, []byte("foo"), 0)
 	if g2 := <-n.Ready(); !reflect.DeepEqual(g2, wants[1]) {
 		t.Errorf("#%d: g = %+v,\n             w   %+v", 2, g2, wants[1])
 	} else {
@@ -761,7 +761,7 @@ func TestNodeAdvance(t *testing.T) {
 	n.Campaign(ctx)
 	<-n.Ready()
 
-	n.Propose(ctx, []byte("foo"))
+	n.Propose(ctx, []byte("foo"), 0)
 	select {
 	case rd = <-n.Ready():
 		t.Fatalf("unexpected Ready before Advance: %+v", rd)
