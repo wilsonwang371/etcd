@@ -104,6 +104,10 @@ func (nc *notifier) notify(err error) {
 }
 
 func warnOfExpensiveRequest(lg *zap.Logger, warningApplyDuration time.Duration, now time.Time, reqStringer fmt.Stringer, respMsg proto.Message, err error) {
+	d := time.Since(now)
+	if d < warningApplyDuration {
+		return
+	}
 	var resp string
 	if !isNil(respMsg) {
 		resp = fmt.Sprintf("size:%d", proto.Size(respMsg))
@@ -127,6 +131,10 @@ func warnOfFailedRequest(lg *zap.Logger, now time.Time, reqStringer fmt.Stringer
 }
 
 func warnOfExpensiveReadOnlyTxnRequest(lg *zap.Logger, warningApplyDuration time.Duration, now time.Time, r *pb.TxnRequest, txnResponse *pb.TxnResponse, err error) {
+	d := time.Since(now)
+	if d < warningApplyDuration {
+		return
+	}
 	reqStringer := pb.NewLoggableTxnRequest(r)
 	var resp string
 	if !isNil(txnResponse) {
@@ -145,6 +153,10 @@ func warnOfExpensiveReadOnlyTxnRequest(lg *zap.Logger, warningApplyDuration time
 }
 
 func warnOfExpensiveReadOnlyRangeRequest(lg *zap.Logger, warningApplyDuration time.Duration, now time.Time, reqStringer fmt.Stringer, rangeResponse *pb.RangeResponse, err error) {
+	d := time.Since(now)
+	if d < warningApplyDuration {
+		return
+	}
 	var resp string
 	if !isNil(rangeResponse) {
 		resp = fmt.Sprintf("range_response_count:%d size:%d", len(rangeResponse.Kvs), rangeResponse.Size())

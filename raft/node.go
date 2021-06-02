@@ -228,6 +228,7 @@ func StartNode(c *Config, peers []Peer) Node {
 	n := newNode(rn)
 
 	go n.run()
+	go n.runResultPoolAllocator()
 	return &n
 }
 
@@ -242,6 +243,7 @@ func RestartNode(c *Config) Node {
 	}
 	n := newNode(rn)
 	go n.run()
+	go n.runResultPoolAllocator()
 	return &n
 }
 
@@ -263,6 +265,8 @@ type node struct {
 	stop       chan struct{}
 	status     chan chan Status
 
+	resultpool chan chan error
+
 	rn *RawNode
 }
 
@@ -277,10 +281,11 @@ func newNode(rn *RawNode) node {
 		// make tickc a buffered chan, so raft node can buffer some ticks when the node
 		// is busy processing raft messages. Raft node will resume process buffered
 		// ticks when it becomes idle.
-		tickc:  make(chan struct{}, 128),
-		done:   make(chan struct{}),
-		stop:   make(chan struct{}),
-		status: make(chan chan Status),
+		tickc:      make(chan struct{}, 128),
+		done:       make(chan struct{}),
+		stop:       make(chan struct{}),
+		status:     make(chan chan Status),
+		resultpool: make(chan chan error, 1000),
 		rn:     rn,
 	}
 }
@@ -295,6 +300,16 @@ func (n *node) Stop() {
 	}
 	// Block until the stop has been acknowledged by run()
 	<-n.done
+}
+
+func (n *node) runResultPoolAllocator() {
+	for {
+		n.resultpool <- make(chan error, 1)
+		select {
+		case <-n.stop:
+			return
+		}
+	}
 }
 
 func (n *node) run() {
@@ -470,7 +485,12 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 	ch := n.propc
 	pm := msgWithResult{m: m}
 	if wait {
-		pm.result = make(chan error, 1)
+		select {
+		case c := <- n.resultpool:
+			pm.result = c
+		default:
+			pm.result = make(chan error, 1)
+		}
 	}
 	select {
 	case ch <- pm:
